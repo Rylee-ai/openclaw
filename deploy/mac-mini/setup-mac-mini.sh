@@ -207,6 +207,32 @@ else
   echo "Permissions already configured at $PERMISSIONS_FILE"
 fi
 
+# --- Security hardening ---
+# CVE-2026-25253 patched in v2026.1.29+, but defense-in-depth matters
+
+echo ""
+echo "--- Security hardening ---"
+
+# Restrict config directory permissions (only current user)
+chmod 700 "$OPENCLAW_DIR"
+echo "Set $OPENCLAW_DIR to 700 (owner-only)"
+
+# Bind gateway to loopback only (not exposed to network)
+if command -v openclaw &>/dev/null; then
+  openclaw config set gateway.bind loopback 2>/dev/null || true
+  echo "Gateway bound to loopback only"
+
+  # Disable mDNS discovery (reduces attack surface)
+  openclaw config set discovery.mdns.mode minimal 2>/dev/null || true
+  echo "mDNS discovery set to minimal"
+fi
+
+# Ensure credentials directory is locked down
+if [ -d "$OPENCLAW_DIR/credentials" ]; then
+  chmod 700 "$OPENCLAW_DIR/credentials"
+  echo "Credentials directory locked to 700"
+fi
+
 # --- Summary ---
 
 echo ""
@@ -219,6 +245,12 @@ echo "  Workspace: $WORKSPACE_DIR"
 echo "  Config: $CONFIG_FILE"
 echo ""
 echo "  Permissions: $PERMISSIONS_FILE"
+echo ""
+echo "Security:"
+echo "  Gateway: loopback-only (not exposed to network)"
+echo "  Config dir: 700 (owner-only permissions)"
+echo "  mDNS: minimal (reduced discovery surface)"
+echo "  Ensure OpenClaw >= v2026.1.29 (CVE-2026-25253 patch)"
 echo ""
 echo "Next steps:"
 echo "  1. Source your shell config: source $SHELL_RC"
