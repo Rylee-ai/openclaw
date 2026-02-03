@@ -24,21 +24,27 @@
     }
   },
 
-  "extensions": {
-    "sharps-edge": {
-      "projectDir": "projects/SHARPS-EDGE",
-      "budgetMonthlyUsd": 200,
-      "budgetAlertThreshold": 0.8,
-      "conflictDetection": {
+  "plugins": {
+    "enabled": true,
+    "entries": {
+      "sharps-edge": {
         "enabled": true,
-        "strictMode": false
-      },
-      "severityRouting": {
-        "INFO": "log",
-        "WARN": "log",
-        "BLOCK": "log",
-        "REJECT": "log",
-        "CRITICAL": "log"
+        "config": {
+          "projectDir": "projects/SHARPS-EDGE",
+          "budgetMonthlyUsd": 200,
+          "budgetAlertThreshold": 0.8,
+          "conflictDetection": {
+            "enabled": true,
+            "strictMode": false
+          },
+          "severityRouting": {
+            "INFO": "log",
+            "WARN": "log",
+            "BLOCK": "log",
+            "REJECT": "log",
+            "CRITICAL": "log"
+          }
+        }
       }
     }
   }
