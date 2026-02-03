@@ -8,12 +8,39 @@
  *  1. Line Value     2. RLM          3. Weather      4. Injuries
  *  5. Social         6. Stale Lines  7. Situational  8. Calibration
  *
+ * All models now call real data sources (free APIs) instead of returning
+ * placeholders. Each model gracefully degrades if its data source fails.
+ *
  * This is what the x402 endpoints will serve.
  */
 
 import { Type } from "@sinclair/typebox";
 
 import type { CostTracker } from "../cost-tracker.js";
+import {
+  VENUES,
+  fetchWeatherForVenue,
+  calculateImpact,
+} from "./get-weather.js";
+import {
+  fetchTeamInjuries,
+  POSITION_IMPACT,
+  ROLE_PLAYER_ALERT_POSITIONS,
+  INJURY_SPORT_PATHS,
+} from "./get-injuries.js";
+import { fetchTeamNews, analyzeSignals, SOCIAL_SPORT_PATHS } from "./get-social.js";
+import {
+  fetchTeamSchedule,
+  calculateRestDays,
+  calculateScheduleDensity,
+  getLastResult,
+  haversineDistance,
+  getTimezoneOffsetDiff,
+  TEAM_TIMEZONES,
+  SITUATIONAL_SPORT_PATHS,
+} from "./situational.js";
+import { loadCalibrationState, findBucket } from "./calibrate.js";
+import { fetchWithCache, ODDS_API_BASE } from "./get-odds.js";
 
 export const CheckEdgeSchema = Type.Object(
   {
@@ -69,6 +96,17 @@ type EdgeAnalysis = {
   disclaimer: string;
 };
 
+// Odds API sport key mapping
+const ODDS_SPORT_KEYS: Record<string, string> = {
+  nfl: "americanfootball_nfl",
+  nba: "basketball_nba",
+  mlb: "baseball_mlb",
+  nhl: "icehockey_nhl",
+};
+
+// NFL key numbers: moves through these are significant
+const NFL_KEY_NUMBERS = [3, 7, 10, 14];
+
 export function createCheckEdgeTool(costTracker: CostTracker) {
   return {
     name: "check_edge",
@@ -93,36 +131,80 @@ export function createCheckEdgeTool(costTracker: CostTracker) {
       const sport = p.sport.toLowerCase();
       const game = p.game.toUpperCase();
 
+      // Parse game format: "AWAY@HOME"
+      const parts = game.split("@");
+      const away = parts[0]?.trim().toLowerCase() ?? "";
+      const home = parts[1]?.trim().toLowerCase() ?? "";
+
+      if (!away || !home) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                error: "Game must be in 'AWAY@HOME' format (e.g. DAL@PHI)",
+              }),
+            },
+          ],
+          details: { error: "Invalid game format" },
+        };
+      }
+
       try {
         const models: ModelResult[] = [];
         const caveats: string[] = [];
 
-        // Always run: Line value analysis
-        models.push(analyzeLineValue(game, sport));
+        // Always run: Line value + RLM (both need odds data)
+        // Fetch odds once and share across models that need them
+        let oddsData: OddsEvent[] | null = null;
+        const apiKey = process.env.THE_ODDS_API_KEY ?? process.env.ODDS_API_KEY;
+        if (apiKey) {
+          try {
+            const oddsSportKey = ODDS_SPORT_KEYS[sport];
+            if (oddsSportKey) {
+              const url =
+                `${ODDS_API_BASE}/sports/${oddsSportKey}/odds` +
+                `?apiKey=${apiKey}&markets=h2h,spreads,totals&regions=us,us2&oddsFormat=american`;
+              const raw = await fetchWithCache(url, `odds_${oddsSportKey}_h2h,spreads,totals_us,us2`, false, costTracker);
+              oddsData = parseOddsEvents(raw);
+            }
+          } catch {
+            caveats.push("Odds API unavailable - line models degraded");
+          }
+        } else {
+          caveats.push("THE_ODDS_API_KEY not set - line models run without live odds");
+        }
 
-        // Always run: Reverse line movement
-        models.push(analyzeRLM(game, sport));
+        // Find the matching game in odds data
+        const matchedEvent = oddsData
+          ? findGameInOdds(oddsData, away, home)
+          : null;
+
+        // Model 1: Line value analysis
+        models.push(analyzeLineValue(matchedEvent, sport));
+
+        // Model 2: Reverse line movement (needs betting % - not available on free tier)
+        models.push(analyzeRLM(matchedEvent));
 
         if (depth === "standard" || depth === "full") {
-          // Weather impact (outdoor sports)
-          models.push(analyzeWeatherImpact(game, sport));
+          // Model 3: Weather impact (outdoor sports)
+          models.push(await analyzeWeatherImpact(home, sport));
 
-          // Injury context
-          models.push(analyzeInjuryContext(game, sport));
+          // Model 4: Injury context
+          models.push(await analyzeInjuryContext(away, home, sport));
         }
 
         if (depth === "full") {
-          // Social / locker room
-          models.push(analyzeSocialSignals(game, sport));
+          // Model 5: Social / locker room
+          models.push(await analyzeSocialSignals(away, home, sport));
 
-          // Stale line detection
-          models.push(analyzeStaleLines(game, sport));
+          // Model 6: Stale line detection
+          models.push(analyzeStaleLines(matchedEvent));
 
-          // Model 7: Situational spots (scheduling, travel, rest)
-          models.push(analyzeSituationalSpots(game, sport));
+          // Model 7: Situational spots
+          models.push(await analyzeSituationalSpots(away, home, sport));
 
-          // Model 8: Calibration overlay (adjusts raw score using tracked accuracy)
-          // Applied after aggregation as a post-processing step
+          // Model 8: Calibration overlay - applied after aggregation
         }
 
         // Aggregate
@@ -163,7 +245,7 @@ export function createCheckEdgeTool(costTracker: CostTracker) {
         let rawEdgeScore = edgeScore;
         let calibrationApplied = false;
         if (depth === "full" && edgeScore > 0) {
-          const calibration = applyCalibrationOverlay(edgeScore);
+          const calibration = await applyCalibrationOverlay(edgeScore);
           if (calibration.corrected) {
             rawEdgeScore = edgeScore;
             edgeScore = calibration.calibrated_score;
@@ -212,9 +294,6 @@ export function createCheckEdgeTool(costTracker: CostTracker) {
           caveats.push("Only 1 model fired - single-signal edges are less reliable");
         }
 
-        // Note: These models return placeholder data until wired to live tool calls.
-        // When deployed, check_edge will call get_odds, get_weather, get_injuries,
-        // get_social internally and synthesize their outputs.
         caveats.push(
           "Edge scores are probabilistic estimates, not predictions. " +
             "Past performance does not guarantee future results.",
@@ -271,25 +350,232 @@ export function createCheckEdgeTool(costTracker: CostTracker) {
   };
 }
 
-// --- Individual model stubs ---
-// In production, these call the other tools (get_odds, get_weather, etc.)
-// and analyze their output. For now they return structured placeholders
-// that show the agent what to expect and how to interpret results.
+// --- Odds data types ---
 
-function analyzeLineValue(_game: string, _sport: string): ModelResult {
+type OddsBookmaker = {
+  key: string;
+  title: string;
+  markets: Array<{
+    key: string; // h2h, spreads, totals
+    outcomes: Array<{
+      name: string;
+      price: number;
+      point?: number;
+    }>;
+  }>;
+};
+
+type OddsEvent = {
+  id: string;
+  home_team: string;
+  away_team: string;
+  commence_time: string;
+  bookmakers: OddsBookmaker[];
+};
+
+function parseOddsEvents(raw: unknown): OddsEvent[] {
+  if (Array.isArray(raw)) return raw as OddsEvent[];
+  if (raw && typeof raw === "object" && "data" in raw) {
+    const d = (raw as Record<string, unknown>).data;
+    if (Array.isArray(d)) return d as OddsEvent[];
+  }
+  return [];
+}
+
+function findGameInOdds(events: OddsEvent[], away: string, home: string): OddsEvent | null {
+  // Match by team abbreviation substring (case-insensitive)
+  const awayUpper = away.toUpperCase();
+  const homeUpper = home.toUpperCase();
+  return events.find((e) => {
+    const eHome = e.home_team.toUpperCase();
+    const eAway = e.away_team.toUpperCase();
+    // Try exact match first, then substring (teams use full names in API)
+    return (
+      (eAway.includes(awayUpper) || awayUpper.includes(eAway.slice(0, 3))) &&
+      (eHome.includes(homeUpper) || homeUpper.includes(eHome.slice(0, 3)))
+    );
+  }) ?? null;
+}
+
+// --- Model 1: Line Value Analysis ---
+
+function analyzeLineValue(event: OddsEvent | null, sport: string): ModelResult {
+  if (!event || event.bookmakers.length === 0) {
+    return {
+      model: "line_value",
+      signal: false,
+      direction: "neutral",
+      confidence: 0,
+      weight: 6,
+      reasoning: "No odds data available for this game. Set THE_ODDS_API_KEY or check game availability.",
+    };
+  }
+
+  // Collect spread lines across books
+  const spreads: Array<{ book: string; homeSpread: number; awaySpread: number }> = [];
+  const totals: Array<{ book: string; total: number }> = [];
+
+  for (const bm of event.bookmakers) {
+    for (const market of bm.markets) {
+      if (market.key === "spreads") {
+        const homeOutcome = market.outcomes.find(
+          (o) => o.name.toUpperCase() === event.home_team.toUpperCase(),
+        );
+        const awayOutcome = market.outcomes.find(
+          (o) => o.name.toUpperCase() === event.away_team.toUpperCase(),
+        );
+        if (homeOutcome?.point != null && awayOutcome?.point != null) {
+          spreads.push({ book: bm.key, homeSpread: homeOutcome.point, awaySpread: awayOutcome.point });
+        }
+      }
+      if (market.key === "totals") {
+        const over = market.outcomes.find((o) => o.name === "Over");
+        if (over?.point != null) {
+          totals.push({ book: bm.key, total: over.point });
+        }
+      }
+    }
+  }
+
+  if (spreads.length === 0) {
+    return {
+      model: "line_value",
+      signal: false,
+      direction: "neutral",
+      confidence: 0,
+      weight: 6,
+      reasoning: "Spread data not available from bookmakers for this game.",
+    };
+  }
+
+  // Check for spread consensus and key number proximity
+  const avgSpread = spreads.reduce((s, x) => s + x.homeSpread, 0) / spreads.length;
+  const spreadRange = Math.max(...spreads.map((s) => s.homeSpread)) - Math.min(...spreads.map((s) => s.homeSpread));
+
+  let signal = false;
+  let confidence = 0;
+  let direction: ModelResult["direction"] = "neutral";
+  const reasons: string[] = [];
+
+  // Key number analysis (NFL-specific)
+  if (sport === "nfl") {
+    for (const kn of NFL_KEY_NUMBERS) {
+      // Check if the line is sitting on or near a key number
+      if (Math.abs(Math.abs(avgSpread) - kn) < 0.5) {
+        reasons.push(`Line at key number ${kn}: moves through this are high-value`);
+        confidence += 15;
+      }
+    }
+  }
+
+  // Spread disagreement across books = potential value
+  if (spreadRange >= 1.5) {
+    signal = true;
+    confidence += 25;
+    // The side getting more points at some books is the value side
+    const maxSpread = Math.max(...spreads.map((s) => s.homeSpread));
+    direction = maxSpread > avgSpread ? "home" : "away";
+    reasons.push(
+      `Spread range ${spreadRange.toFixed(1)} pts across ${spreads.length} books. ` +
+        `Shop for best number on ${direction === "home" ? event.home_team : event.away_team}.`,
+    );
+  }
+
+  // Totals consensus
+  if (totals.length >= 2) {
+    const avgTotal = totals.reduce((s, x) => s + x.total, 0) / totals.length;
+    const totalRange = Math.max(...totals.map((t) => t.total)) - Math.min(...totals.map((t) => t.total));
+    if (totalRange >= 1.5) {
+      reasons.push(`Total range ${totalRange.toFixed(1)} across books (avg ${avgTotal.toFixed(1)}). Line shopping opportunity.`);
+    }
+  }
+
+  if (!signal && confidence > 0) {
+    signal = true;
+  }
+
   return {
     model: "line_value",
-    signal: false,
-    direction: "neutral",
-    confidence: 0,
+    signal,
+    direction,
+    confidence: Math.min(confidence, 80),
     weight: 6,
-    reasoning:
-      "Line value model requires live odds data. Call get_odds first, " +
-      "then compare opening vs current line. Look for moves through key numbers.",
+    reasoning: reasons.length > 0
+      ? reasons.join(" ")
+      : `Consensus spread: ${avgSpread > 0 ? "+" : ""}${avgSpread.toFixed(1)} across ${spreads.length} books. No significant line value detected.`,
   };
 }
 
-function analyzeRLM(_game: string, _sport: string): ModelResult {
+// --- Model 2: Reverse Line Movement ---
+
+function analyzeRLM(event: OddsEvent | null): ModelResult {
+  // RLM requires public betting percentages, which are not available from
+  // The Odds API free tier. We detect what we can from multi-book line movement.
+  if (!event || event.bookmakers.length < 2) {
+    return {
+      model: "reverse_line_movement",
+      signal: false,
+      direction: "neutral",
+      confidence: 0,
+      weight: 8,
+      reasoning:
+        "RLM model requires public betting % data (not available on free tier). " +
+        "Multi-book comparison insufficient for RLM detection. " +
+        "Upgrade to The Odds API paid tier for historical line movement data.",
+    };
+  }
+
+  // Partial RLM proxy: if spreads across books show unusual divergence patterns,
+  // it may indicate sharp money at specific books
+  const spreads: Array<{ book: string; homeSpread: number }> = [];
+  for (const bm of event.bookmakers) {
+    const spreadMkt = bm.markets.find((m) => m.key === "spreads");
+    const homeOutcome = spreadMkt?.outcomes.find(
+      (o) => o.name.toUpperCase() === event.home_team.toUpperCase(),
+    );
+    if (homeOutcome?.point != null) {
+      spreads.push({ book: bm.key, homeSpread: homeOutcome.point });
+    }
+  }
+
+  if (spreads.length < 3) {
+    return {
+      model: "reverse_line_movement",
+      signal: false,
+      direction: "neutral",
+      confidence: 0,
+      weight: 8,
+      reasoning: "Insufficient book coverage for RLM proxy analysis.",
+    };
+  }
+
+  // Sharp books (Pinnacle, Circa) vs public books can reveal movement direction
+  const sharpBooks = ["pinnacle", "williamhill_us", "lowvig"];
+  const sharpLines = spreads.filter((s) => sharpBooks.includes(s.book));
+  const publicLines = spreads.filter((s) => !sharpBooks.includes(s.book));
+
+  if (sharpLines.length > 0 && publicLines.length > 0) {
+    const sharpAvg = sharpLines.reduce((s, x) => s + x.homeSpread, 0) / sharpLines.length;
+    const publicAvg = publicLines.reduce((s, x) => s + x.homeSpread, 0) / publicLines.length;
+    const diff = sharpAvg - publicAvg;
+
+    if (Math.abs(diff) >= 1.0) {
+      // Sharp books moving differently from public books
+      const direction: ModelResult["direction"] = diff > 0 ? "home" : "away";
+      return {
+        model: "reverse_line_movement",
+        signal: true,
+        direction,
+        confidence: Math.min(Math.round(Math.abs(diff) * 20), 60),
+        weight: 8,
+        reasoning:
+          `Sharp/public book divergence detected: ${Math.abs(diff).toFixed(1)} pts. ` +
+          `Sharp books favor ${direction === "home" ? event.home_team : event.away_team}. ` +
+          `This is a proxy for RLM - full analysis requires betting % data.`,
+      };
+    }
+  }
+
   return {
     model: "reverse_line_movement",
     signal: false,
@@ -297,104 +583,568 @@ function analyzeRLM(_game: string, _sport: string): ModelResult {
     confidence: 0,
     weight: 8,
     reasoning:
-      "RLM model requires public betting % and line movement data. " +
-      "When >70% public on one side and line moves opposite = sharp money signal.",
+      `Analyzed ${spreads.length} books. No sharp/public divergence detected. ` +
+      "Full RLM requires betting % data from paid tier.",
   };
 }
 
-function analyzeWeatherImpact(_game: string, _sport: string): ModelResult {
-  return {
-    model: "weather_impact",
-    signal: false,
-    direction: "neutral",
-    confidence: 0,
-    weight: 7,
-    reasoning:
-      "Weather model requires get_weather data for game venue + time. " +
-      "Wind >15mph, precipitation, extreme temps create under signals.",
-  };
+// --- Model 3: Weather Impact ---
+
+async function analyzeWeatherImpact(homeTeam: string, sport: string): Promise<ModelResult> {
+  try {
+    // Look up venue for home team
+    const venue = VENUES[homeTeam];
+    if (!venue) {
+      return {
+        model: "weather_impact",
+        signal: false,
+        direction: "neutral",
+        confidence: 0,
+        weight: 7,
+        reasoning: `No venue data for '${homeTeam.toUpperCase()}'. Add venue or use get_weather directly.`,
+      };
+    }
+
+    // Dome = no weather impact
+    if (venue.dome) {
+      return {
+        model: "weather_impact",
+        signal: false,
+        direction: "neutral",
+        confidence: 0,
+        weight: 7,
+        reasoning: `${venue.name} is a dome. Weather has no impact on this game.`,
+      };
+    }
+
+    // Fetch real weather data
+    const weather = await fetchWeatherForVenue(venue.lat, venue.lon);
+    const impact = calculateImpact(weather, sport);
+
+    if (impact.confidence === 0 || impact.total_adjustment === 0) {
+      return {
+        model: "weather_impact",
+        signal: false,
+        direction: "neutral",
+        confidence: 0,
+        weight: 7,
+        reasoning:
+          `${venue.name}: ${weather.temperature_f}°F, wind ${weather.wind_speed_mph}mph, ` +
+          `precip ${weather.precipitation_prob}%. ${impact.factors[0]}`,
+      };
+    }
+
+    const direction: ModelResult["direction"] = impact.total_adjustment < 0 ? "under" : "over";
+
+    return {
+      model: "weather_impact",
+      signal: true,
+      direction,
+      confidence: impact.confidence,
+      weight: 7,
+      reasoning:
+        `${venue.name}: ${weather.temperature_f}°F, wind ${weather.wind_speed_mph}mph ` +
+        `(gusts ${weather.wind_gusts_mph}mph), precip ${weather.precipitation_prob}%. ` +
+        `${impact.factors.join(". ")}. ${impact.recommendation}`,
+    };
+  } catch (e) {
+    return {
+      model: "weather_impact",
+      signal: false,
+      direction: "neutral",
+      confidence: 0,
+      weight: 7,
+      reasoning: `Weather fetch failed: ${e instanceof Error ? e.message : String(e)}. Model degraded.`,
+    };
+  }
 }
 
-function analyzeInjuryContext(_game: string, _sport: string): ModelResult {
-  return {
-    model: "injury_context",
-    signal: false,
-    direction: "neutral",
-    confidence: 0,
-    weight: 5,
-    reasoning:
-      "Injury model requires get_injuries for both teams. " +
-      "Focus on underpriced role player injuries (O-line, bullpen, corners).",
-  };
+// --- Model 4: Injury Context ---
+
+async function analyzeInjuryContext(
+  away: string,
+  home: string,
+  sport: string,
+): Promise<ModelResult> {
+  const sportPath = INJURY_SPORT_PATHS[sport];
+  if (!sportPath) {
+    return {
+      model: "injury_context",
+      signal: false,
+      direction: "neutral",
+      confidence: 0,
+      weight: 5,
+      reasoning: `Unsupported sport '${sport}' for injury analysis.`,
+    };
+  }
+
+  const sportKey = sportPath.split("/")[1];
+
+  try {
+    const [awayInjuries, homeInjuries] = await Promise.all([
+      fetchTeamInjuries(sportPath, away.toUpperCase()).catch(() => []),
+      fetchTeamInjuries(sportPath, home.toUpperCase()).catch(() => []),
+    ]);
+
+    // Analyze edge signals: underpriced injuries
+    const analyzeTeam = (injuries: typeof awayInjuries) => {
+      let edgeSignalCount = 0;
+      let totalImpact = 0;
+      const keyMissing: string[] = [];
+
+      for (const inj of injuries) {
+        if (inj.status !== "Out" && inj.status !== "Doubtful") continue;
+
+        const posImpact = POSITION_IMPACT[sportKey]?.[inj.position] ?? 3;
+        const isRolePlayer = ROLE_PLAYER_ALERT_POSITIONS[sportKey]?.includes(inj.position) ?? false;
+        const likelyPriced = posImpact >= 8;
+
+        if (isRolePlayer && !likelyPriced) {
+          edgeSignalCount++;
+          totalImpact += posImpact;
+          keyMissing.push(`${inj.player} (${inj.position}, impact:${posImpact})`);
+        } else if (posImpact >= 7) {
+          totalImpact += posImpact;
+          keyMissing.push(`${inj.player} (${inj.position}, likely priced)`);
+        }
+      }
+
+      return { edgeSignalCount, totalImpact, keyMissing, total: injuries.length };
+    };
+
+    const awayAnalysis = analyzeTeam(awayInjuries);
+    const homeAnalysis = analyzeTeam(homeInjuries);
+
+    const awayEdge = awayAnalysis.edgeSignalCount;
+    const homeEdge = homeAnalysis.edgeSignalCount;
+    const differential = awayEdge - homeEdge; // Positive = away has more underpriced injuries
+
+    if (awayEdge === 0 && homeEdge === 0) {
+      return {
+        model: "injury_context",
+        signal: false,
+        direction: "neutral",
+        confidence: 0,
+        weight: 5,
+        reasoning:
+          `Away (${away.toUpperCase()}): ${awayAnalysis.total} injuries, 0 underpriced edge signals. ` +
+          `Home (${home.toUpperCase()}): ${homeAnalysis.total} injuries, 0 underpriced edge signals. ` +
+          "No underpriced role player absences detected.",
+      };
+    }
+
+    // Direction: the team with MORE underpriced injuries is disadvantaged
+    let direction: ModelResult["direction"] = "neutral";
+    if (differential > 0) direction = "home"; // Away team weakened = lean home
+    else if (differential < 0) direction = "away"; // Home team weakened = lean away
+
+    const confidence = Math.min(
+      Math.max(awayEdge, homeEdge) * 15 + Math.abs(differential) * 10,
+      70,
+    );
+
+    const reasons: string[] = [];
+    if (awayAnalysis.keyMissing.length > 0) {
+      reasons.push(`${away.toUpperCase()} missing: ${awayAnalysis.keyMissing.join(", ")}`);
+    }
+    if (homeAnalysis.keyMissing.length > 0) {
+      reasons.push(`${home.toUpperCase()} missing: ${homeAnalysis.keyMissing.join(", ")}`);
+    }
+
+    return {
+      model: "injury_context",
+      signal: true,
+      direction,
+      confidence,
+      weight: 5,
+      reasoning: reasons.join(". ") + `. Edge signals: away=${awayEdge}, home=${homeEdge}.`,
+    };
+  } catch (e) {
+    return {
+      model: "injury_context",
+      signal: false,
+      direction: "neutral",
+      confidence: 0,
+      weight: 5,
+      reasoning: `Injury fetch failed: ${e instanceof Error ? e.message : String(e)}. Model degraded.`,
+    };
+  }
 }
 
-function analyzeSocialSignals(_game: string, _sport: string): ModelResult {
-  return {
-    model: "social_signals",
-    signal: false,
-    direction: "neutral",
-    confidence: 0,
-    weight: 4,
-    reasoning:
-      "Social model requires get_social for both teams. " +
-      "Locker room issues, coaching conflicts, and motivation factors.",
-  };
+// --- Model 5: Social Signals ---
+
+async function analyzeSocialSignals(
+  away: string,
+  home: string,
+  sport: string,
+): Promise<ModelResult> {
+  const sportPath = SOCIAL_SPORT_PATHS[sport];
+  if (!sportPath) {
+    return {
+      model: "social_signals",
+      signal: false,
+      direction: "neutral",
+      confidence: 0,
+      weight: 4,
+      reasoning: `Unsupported sport '${sport}' for social analysis.`,
+    };
+  }
+
+  try {
+    const [awayArticles, homeArticles] = await Promise.all([
+      fetchTeamNews(sportPath, away.toUpperCase()).catch(() => []),
+      fetchTeamNews(sportPath, home.toUpperCase()).catch(() => []),
+    ]);
+
+    const awaySignals = analyzeSignals(awayArticles);
+    const homeSignals = analyzeSignals(homeArticles);
+
+    const awayNegTotal = awaySignals.negative.reduce((s, n) => s + n.weight, 0);
+    const awayPosTotal = awaySignals.positive.reduce((s, n) => s + n.weight, 0);
+    const homeNegTotal = homeSignals.negative.reduce((s, n) => s + n.weight, 0);
+    const homePosTotal = homeSignals.positive.reduce((s, n) => s + n.weight, 0);
+
+    const awayNet = awayPosTotal - awayNegTotal;
+    const homeNet = homePosTotal - homeNegTotal;
+    const differential = homeNet - awayNet; // Positive = home in better shape
+
+    if (Math.abs(differential) < 3) {
+      return {
+        model: "social_signals",
+        signal: false,
+        direction: "neutral",
+        confidence: 0,
+        weight: 4,
+        reasoning:
+          `${away.toUpperCase()} sentiment: ${awayNet} (${awayArticles.length} articles). ` +
+          `${home.toUpperCase()} sentiment: ${homeNet} (${homeArticles.length} articles). ` +
+          "No significant sentiment differential.",
+      };
+    }
+
+    const direction: ModelResult["direction"] = differential > 0 ? "home" : "away";
+    const confidence = Math.min(Math.abs(differential) * 5, 60);
+
+    const reasons: string[] = [];
+    if (awaySignals.negative.length > 0) {
+      reasons.push(`${away.toUpperCase()} negatives: ${awaySignals.negative.map((s) => s.category).join(", ")}`);
+    }
+    if (homeSignals.negative.length > 0) {
+      reasons.push(`${home.toUpperCase()} negatives: ${homeSignals.negative.map((s) => s.category).join(", ")}`);
+    }
+    if (awaySignals.positive.length > 0) {
+      reasons.push(`${away.toUpperCase()} positives: ${awaySignals.positive.map((s) => s.category).join(", ")}`);
+    }
+    if (homeSignals.positive.length > 0) {
+      reasons.push(`${home.toUpperCase()} positives: ${homeSignals.positive.map((s) => s.category).join(", ")}`);
+    }
+
+    return {
+      model: "social_signals",
+      signal: true,
+      direction,
+      confidence,
+      weight: 4,
+      reasoning:
+        reasons.join(". ") +
+        `. Net sentiment: ${away.toUpperCase()}=${awayNet}, ${home.toUpperCase()}=${homeNet}. ` +
+        `Differential favors ${direction === "home" ? home.toUpperCase() : away.toUpperCase()}.`,
+    };
+  } catch (e) {
+    return {
+      model: "social_signals",
+      signal: false,
+      direction: "neutral",
+      confidence: 0,
+      weight: 4,
+      reasoning: `Social fetch failed: ${e instanceof Error ? e.message : String(e)}. Model degraded.`,
+    };
+  }
 }
 
-function analyzeStaleLines(_game: string, _sport: string): ModelResult {
+// --- Model 6: Stale Line Detection ---
+
+function analyzeStaleLines(event: OddsEvent | null): ModelResult {
+  if (!event || event.bookmakers.length < 3) {
+    return {
+      model: "stale_line_detection",
+      signal: false,
+      direction: "neutral",
+      confidence: 0,
+      weight: 9,
+      reasoning: "Need 3+ books for stale line detection. Insufficient data.",
+    };
+  }
+
+  // Compare spreads across books - a stale line is one book lagging behind consensus
+  const spreads: Array<{ book: string; homeSpread: number }> = [];
+  for (const bm of event.bookmakers) {
+    const spreadMkt = bm.markets.find((m) => m.key === "spreads");
+    const homeOutcome = spreadMkt?.outcomes.find(
+      (o) => o.name.toUpperCase() === event.home_team.toUpperCase(),
+    );
+    if (homeOutcome?.point != null) {
+      spreads.push({ book: bm.key, homeSpread: homeOutcome.point });
+    }
+  }
+
+  if (spreads.length < 3) {
+    return {
+      model: "stale_line_detection",
+      signal: false,
+      direction: "neutral",
+      confidence: 0,
+      weight: 9,
+      reasoning: "Insufficient spread data across books for stale line detection.",
+    };
+  }
+
+  const avg = spreads.reduce((s, x) => s + x.homeSpread, 0) / spreads.length;
+  const outliers = spreads.filter((s) => Math.abs(s.homeSpread - avg) >= 2.0);
+
+  if (outliers.length === 0) {
+    return {
+      model: "stale_line_detection",
+      signal: false,
+      direction: "neutral",
+      confidence: 0,
+      weight: 9,
+      reasoning:
+        `${spreads.length} books checked. All within 2pts of consensus (${avg > 0 ? "+" : ""}${avg.toFixed(1)}). ` +
+        "No stale lines detected.",
+    };
+  }
+
+  // Stale line found: bet the outlier book on the side getting more points than consensus
+  const bestOutlier = outliers.sort(
+    (a, b) => Math.abs(b.homeSpread - avg) - Math.abs(a.homeSpread - avg),
+  )[0];
+  const diff = bestOutlier.homeSpread - avg;
+  const direction: ModelResult["direction"] = diff > 0 ? "home" : "away";
+
   return {
     model: "stale_line_detection",
-    signal: false,
-    direction: "neutral",
-    confidence: 0,
+    signal: true,
+    direction,
+    confidence: Math.min(Math.round(Math.abs(diff) * 15), 75),
     weight: 9,
     reasoning:
-      "Stale line model requires multi-book odds comparison from get_odds. " +
-      "When one book lags 2+ points after news = immediate opportunity.",
+      `STALE LINE at ${bestOutlier.book}: ${bestOutlier.homeSpread > 0 ? "+" : ""}${bestOutlier.homeSpread} ` +
+      `vs consensus ${avg > 0 ? "+" : ""}${avg.toFixed(1)} (${Math.abs(diff).toFixed(1)}pt gap). ` +
+      `Bet ${direction === "home" ? event.home_team : event.away_team} at ${bestOutlier.book} before it moves.`,
   };
 }
 
-function analyzeSituationalSpots(_game: string, _sport: string): ModelResult {
-  return {
-    model: "situational_spots",
-    signal: false,
-    direction: "neutral",
-    confidence: 0,
-    weight: 6,
-    reasoning:
-      "Situational model requires get_situational data for game context. " +
-      "Analyzes rest differentials, travel distance, schedule density, " +
-      "trap/letdown/sandwich spots, and altitude effects. Compound spots " +
-      "(multiple negatives stacking) are the strongest signals. " +
-      "No human can track all scheduling angles simultaneously.",
-  };
+// --- Model 7: Situational Spots ---
+
+async function analyzeSituationalSpots(
+  away: string,
+  home: string,
+  sport: string,
+): Promise<ModelResult> {
+  const sportPath = SITUATIONAL_SPORT_PATHS[sport];
+  if (!sportPath) {
+    return {
+      model: "situational_spots",
+      signal: false,
+      direction: "neutral",
+      confidence: 0,
+      weight: 6,
+      reasoning: `Unsupported sport '${sport}' for situational analysis.`,
+    };
+  }
+
+  try {
+    const gameDate = new Date().toISOString().slice(0, 10);
+
+    const [awaySchedule, homeSchedule] = await Promise.all([
+      fetchTeamSchedule(sportPath, away).catch(() => []),
+      fetchTeamSchedule(sportPath, home).catch(() => []),
+    ]);
+
+    const signals: string[] = [];
+    let awayNegScore = 0;
+    let homeNegScore = 0;
+
+    // Rest differential
+    const awayRest = calculateRestDays(awaySchedule, gameDate);
+    const homeRest = calculateRestDays(homeSchedule, gameDate);
+    const restDiff = homeRest - awayRest;
+
+    if (Math.abs(restDiff) >= 2) {
+      const fatigued = restDiff > 0 ? away : home;
+      const score = Math.min(Math.abs(restDiff) * 2, 8);
+      if (fatigued === away) awayNegScore += score;
+      else homeNegScore += score;
+      signals.push(`Rest differential: ${Math.abs(restDiff)} days (${fatigued.toUpperCase()} disadvantaged)`);
+    }
+
+    // Back-to-back (NBA/NHL)
+    if (sport === "nba" || sport === "nhl") {
+      if (awayRest === 0) {
+        awayNegScore += 7;
+        signals.push(`${away.toUpperCase()} on road back-to-back`);
+      }
+      if (homeRest === 0) {
+        homeNegScore += 5;
+        signals.push(`${home.toUpperCase()} on home back-to-back`);
+      }
+
+      const awayDensity = calculateScheduleDensity(awaySchedule, gameDate, 4);
+      if (awayDensity >= 3) {
+        awayNegScore += 6;
+        signals.push(`${away.toUpperCase()} playing ${awayDensity}-in-4 nights`);
+      }
+      const homeDensity = calculateScheduleDensity(homeSchedule, gameDate, 4);
+      if (homeDensity >= 3) {
+        homeNegScore += 5;
+        signals.push(`${home.toUpperCase()} playing ${homeDensity}-in-4 nights`);
+      }
+    }
+
+    // Travel distance
+    const awayGeo = TEAM_TIMEZONES[away];
+    const homeGeo = TEAM_TIMEZONES[home];
+    if (awayGeo && homeGeo) {
+      const dist = haversineDistance(awayGeo.lat, awayGeo.lon, homeGeo.lat, homeGeo.lon);
+      if (dist > 1500) {
+        const score = dist > 2500 ? 5 : 3;
+        awayNegScore += score;
+        signals.push(`${away.toUpperCase()} traveled ~${Math.round(dist)} miles`);
+      }
+
+      const tzDiff = getTimezoneOffsetDiff(awayGeo.tz, homeGeo.tz);
+      if (tzDiff >= 2) {
+        awayNegScore += 4;
+        signals.push(`${away.toUpperCase()} ${tzDiff}hr timezone disadvantage`);
+      }
+    }
+
+    // Altitude
+    if (home === "den" || home === "col") {
+      awayNegScore += 4;
+      signals.push("Altitude factor (5,280ft)");
+    }
+
+    // NFL Thursday game
+    if (sport === "nfl") {
+      const gameDay = new Date(gameDate).getDay();
+      if (gameDay === 4) {
+        signals.push("Thursday game: short week hurts favorites");
+      }
+
+      // Letdown spots
+      const awayPrev = getLastResult(awaySchedule, gameDate);
+      if (awayPrev?.isBlowoutWin) {
+        awayNegScore += 5;
+        signals.push(`${away.toUpperCase()} letdown spot after blowout win`);
+      }
+      const homePrev = getLastResult(homeSchedule, gameDate);
+      if (homePrev?.isBlowoutWin) {
+        homeNegScore += 4;
+        signals.push(`${home.toUpperCase()} letdown spot after blowout win`);
+      }
+    }
+
+    // MLB day-after-night
+    if (sport === "mlb") {
+      const awayPrev = getLastResult(awaySchedule, gameDate);
+      if (awayPrev?.wasNightGame) {
+        awayNegScore += 5;
+        signals.push(`${away.toUpperCase()} road day after night game`);
+      }
+    }
+
+    const differential = homeNegScore - awayNegScore;
+
+    if (signals.length === 0 || Math.abs(differential) < 3) {
+      return {
+        model: "situational_spots",
+        signal: false,
+        direction: "neutral",
+        confidence: 0,
+        weight: 6,
+        reasoning:
+          signals.length > 0
+            ? `Spots detected but balanced: ${signals.join("; ")}. No clear edge.`
+            : `Rest: away=${awayRest}d, home=${homeRest}d. No significant situational factors.`,
+      };
+    }
+
+    const direction: ModelResult["direction"] = differential > 0 ? "away" : "home";
+    const confidence = Math.min(Math.abs(differential) * 5, 70);
+
+    return {
+      model: "situational_spots",
+      signal: true,
+      direction,
+      confidence,
+      weight: 6,
+      reasoning:
+        `${signals.length} situational factors: ${signals.join("; ")}. ` +
+        `Negative scores: ${away.toUpperCase()}=${awayNegScore}, ${home.toUpperCase()}=${homeNegScore}. ` +
+        `Edge favors ${direction === "home" ? home.toUpperCase() : away.toUpperCase()}.`,
+    };
+  } catch (e) {
+    return {
+      model: "situational_spots",
+      signal: false,
+      direction: "neutral",
+      confidence: 0,
+      weight: 6,
+      reasoning: `Situational fetch failed: ${e instanceof Error ? e.message : String(e)}. Model degraded.`,
+    };
+  }
 }
 
-// Calibration overlay reads persisted calibration state.
-// It adjusts the raw edge score based on historical accuracy per confidence bucket.
-function applyCalibrationOverlay(rawScore: number): {
+// --- Model 8: Calibration Overlay ---
+
+async function applyCalibrationOverlay(rawScore: number): Promise<{
   corrected: boolean;
   calibrated_score: number;
   reasoning: string;
-} {
-  // In production, this reads ~/.openclaw/workspace/data/calibration.json
-  // populated by the `calibrate correct` action. For now, returns uncorrected.
-  //
-  // When wired:
-  //   1. Load calibration.json
-  //   2. Find the bucket matching rawScore
-  //   3. Apply correction_factor: calibrated = rawScore * correction
-  //   4. Return the adjusted score
-  //
-  // This is the trust engine. If we say 65% and win 65% of those, we're calibrated.
-  // If we win 55%, the correction factor pulls future 65% calls down to ~55%.
-  return {
-    corrected: false,
-    calibrated_score: rawScore,
-    reasoning:
-      "Calibration overlay requires calibration data from the `calibrate correct` action. " +
-      "Once 20+ resolved picks exist and corrections are calculated, this model will " +
-      "adjust the raw edge score to match observed accuracy per confidence bucket. " +
-      "Calibrated probability is the product - x402 customers pay for trustworthy numbers.",
-  };
+}> {
+  try {
+    const calibrationFile =
+      (process.env.HOME ?? "/root") + "/.openclaw/workspace/data/calibration.json";
+    const state = await loadCalibrationState(calibrationFile);
+
+    if (!state || Object.keys(state.corrections).length === 0) {
+      return {
+        corrected: false,
+        calibrated_score: rawScore,
+        reasoning:
+          "No calibration data available. Run `calibrate correct` after 20+ resolved picks. " +
+          "Raw score returned unchanged.",
+      };
+    }
+
+    const bucket = findBucket(rawScore);
+    const key = `${bucket.low}-${bucket.high}`;
+    const correction = state.corrections[key] ?? 1.0;
+
+    if (correction === 1.0) {
+      return {
+        corrected: false,
+        calibrated_score: rawScore,
+        reasoning:
+          `Bucket ${key}: correction factor = 1.0 (no adjustment needed or insufficient data).`,
+      };
+    }
+
+    const calibrated = Math.min(Math.round(rawScore * correction), 99);
+    return {
+      corrected: true,
+      calibrated_score: calibrated,
+      reasoning:
+        `Calibration applied: ${rawScore}% × ${correction.toFixed(3)} = ${calibrated}%. ` +
+        `Status: ${state.status}. Based on ${state.total_calibrated_picks} resolved picks.`,
+    };
+  } catch {
+    return {
+      corrected: false,
+      calibrated_score: rawScore,
+      reasoning: "Calibration file not found or unreadable. Raw score returned.",
+    };
+  }
 }

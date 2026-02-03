@@ -146,6 +146,9 @@ export function createGetSocialTool() {
   };
 }
 
+// Exported for use by check-edge orchestrator
+export { fetchTeamNews, analyzeSignals, SPORT_PATHS as SOCIAL_SPORT_PATHS };
+
 type Article = {
   headline: string;
   description: string;

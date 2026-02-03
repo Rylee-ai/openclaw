@@ -188,6 +188,10 @@ export function createGetInjuriesTool() {
   };
 }
 
+// Exported for use by check-edge orchestrator
+export { fetchTeamInjuries, POSITION_IMPACT, ROLE_PLAYER_ALERT_POSITIONS, SPORT_PATHS as INJURY_SPORT_PATHS };
+export type { InjuryEntry };
+
 type InjuryEntry = {
   player: string;
   team: string;

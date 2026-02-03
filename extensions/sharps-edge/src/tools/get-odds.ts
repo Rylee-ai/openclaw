@@ -106,6 +106,9 @@ export function createGetOddsTool(costTracker: CostTracker) {
   };
 }
 
+// Exported for use by check-edge orchestrator
+export { fetchWithCache, ODDS_API_BASE };
+
 async function fetchWithCache(
   url: string,
   cacheKey: string,

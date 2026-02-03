@@ -365,6 +365,19 @@ export function createGetSituationalTool() {
   };
 }
 
+// Exported for use by check-edge orchestrator
+export {
+  fetchTeamSchedule,
+  calculateRestDays,
+  calculateScheduleDensity,
+  getLastResult,
+  haversineDistance,
+  getTimezoneOffsetDiff,
+  TEAM_TIMEZONES,
+  SPORT_PATHS as SITUATIONAL_SPORT_PATHS,
+};
+export type { SpotSignal, ScheduleGame };
+
 // --- Helper functions ---
 
 type ScheduleGame = {

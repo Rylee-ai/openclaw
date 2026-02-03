@@ -290,6 +290,10 @@ export function createCalibrateTool(api: OpenClawPluginApi) {
   };
 }
 
+// Exported for use by check-edge orchestrator
+export { loadCalibrationState, findBucket };
+export type { CalibrationState };
+
 // --- Internals ---
 
 async function loadCalibrationState(

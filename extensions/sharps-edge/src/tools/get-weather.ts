@@ -217,6 +217,53 @@ type Impact = {
   recommendation: string;
 };
 
+// Exported for use by check-edge orchestrator
+export { VENUES, calculateImpact };
+export type { WeatherData, Impact };
+
+export async function fetchWeatherForVenue(
+  lat: number,
+  lon: number,
+  gameTime?: Date,
+): Promise<WeatherData> {
+  const time = gameTime ?? new Date();
+  const dateStr = time.toISOString().slice(0, 10);
+  const hour = time.getUTCHours();
+
+  const url =
+    `${OPEN_METEO_BASE}?latitude=${lat}&longitude=${lon}` +
+    `&hourly=temperature_2m,wind_speed_10m,wind_gusts_10m,precipitation_probability,precipitation,relative_humidity_2m` +
+    `&temperature_unit=fahrenheit&wind_speed_unit=mph` +
+    `&start_date=${dateStr}&end_date=${dateStr}`;
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Open-Meteo ${res.status}`);
+  }
+
+  const data = (await res.json()) as {
+    hourly: {
+      time: string[];
+      temperature_2m: number[];
+      wind_speed_10m: number[];
+      wind_gusts_10m: number[];
+      precipitation_probability: number[];
+      precipitation: number[];
+      relative_humidity_2m: number[];
+    };
+  };
+
+  const idx = Math.min(hour, (data.hourly?.time?.length ?? 1) - 1);
+  return {
+    temperature_f: data.hourly.temperature_2m[idx],
+    wind_speed_mph: data.hourly.wind_speed_10m[idx],
+    wind_gusts_mph: data.hourly.wind_gusts_10m[idx],
+    precipitation_prob: data.hourly.precipitation_probability[idx],
+    precipitation_mm: data.hourly.precipitation[idx],
+    humidity_pct: data.hourly.relative_humidity_2m[idx],
+  };
+}
+
 function calculateImpact(w: WeatherData, sport: string): Impact {
   const factors: string[] = [];
   let totalAdj = 0;
