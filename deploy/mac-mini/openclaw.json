@@ -1,7 +1,4 @@
 {
-  // SHARPS EDGE Builder Edition - Mac Mini Configuration
-  // Uses OpenRouter free models for thinking, Claude Code CLI for building
-
   "env": {
     "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"
   },
@@ -10,7 +7,6 @@
     "defaults": {
       "workspace": "~/.openclaw/workspace",
 
-      // Primary: free DeepSeek R1 for reasoning tasks
       "model": {
         "primary": "openrouter/deepseek/deepseek-r1-0528",
         "fallbacks": [
@@ -28,7 +24,6 @@
     }
   },
 
-  // SHARPS EDGE extension config
   "extensions": {
     "sharps-edge": {
       "projectDir": "projects/SHARPS-EDGE",

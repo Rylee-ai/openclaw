@@ -116,7 +116,7 @@ async function fetchWithCache(
   if (!forceRefresh) {
     const cached = cache.get(cacheKey);
     if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
-      return { ...cached.data as Record<string, unknown>, _cached: true, _age_seconds: Math.round((Date.now() - cached.fetchedAt) / 1000) };
+      return { data: cached.data, _cached: true, _age_seconds: Math.round((Date.now() - cached.fetchedAt) / 1000) };
     }
   }
 

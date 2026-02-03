@@ -147,9 +147,9 @@ async function checkScope(ctx: CheckContext): Promise<ConflictResult> {
   // Block operations entirely outside the workspace, /tmp, or the repo
   const repoRoot = path.resolve(ctx.workspaceDir, "..", "..");
   if (
-    !absTarget.startsWith(absWorkspace) &&
-    !absTarget.startsWith("/tmp") &&
-    !absTarget.startsWith(repoRoot)
+    !absTarget.startsWith(absWorkspace + "/") && absTarget !== absWorkspace &&
+    !absTarget.startsWith("/tmp/") && absTarget !== "/tmp" &&
+    !absTarget.startsWith(repoRoot + "/") && absTarget !== repoRoot
   ) {
     return {
       status: "BLOCK",
@@ -480,13 +480,7 @@ export function registerConflictDetector(
         charter,
       };
 
-      // Write active lock for contention detection
       const filePath = extractFilePath(event.params);
-      await writeActiveLock(workspaceDir, {
-        toolName: event.toolName,
-        filePath,
-        startedAt: new Date().toISOString(),
-      });
 
       // Run all six checks
       for (const { name, check } of CONFLICT_CHECKS) {
@@ -510,7 +504,6 @@ export function registerConflictDetector(
             // In strict mode, block on any failure. Otherwise only CRITICAL and REJECT.
             if (strictMode || result.status === "CRITICAL" || result.status === "REJECT") {
               api.logger.warn(`sharps-edge: ${result.status} [${name}] ${result.reason}`);
-              await writeActiveLock(workspaceDir, null); // Release lock
               return {
                 block: true,
                 blockReason: `[SHARPS EDGE ${result.status}] Check "${name}" failed: ${result.reason}`,
@@ -524,7 +517,13 @@ export function registerConflictDetector(
         }
       }
 
-      return; // All checks passed
+      // All checks passed — write active lock for contention detection
+      await writeActiveLock(workspaceDir, {
+        toolName: event.toolName,
+        filePath,
+        startedAt: new Date().toISOString(),
+      });
+      return;
     },
     { priority: 10 },
   );

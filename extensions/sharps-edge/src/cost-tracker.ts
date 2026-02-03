@@ -187,6 +187,36 @@ export class CostTracker {
     return state.totalSpentUsd / this.monthlyLimitUsd;
   }
 
+  /**
+   * Track a direct API call from a tool (not a shell command).
+   * Increments the quota counter for the given API key and returns remaining quota.
+   */
+  async trackApiCall(apiKey: string): Promise<{ remaining: number; warning: string | null }> {
+    const state = await this.loadState();
+    const quota = state.apiQuotas[apiKey];
+    if (!quota) {
+      return { remaining: Infinity, warning: null };
+    }
+
+    quota.used++;
+    this.dirty = true;
+
+    const remaining = quota.limit - quota.used;
+    let warning: string | null = null;
+    if (remaining <= 0) {
+      warning = `API quota exhausted for ${apiKey} (${quota.used}/${quota.limit})`;
+    } else if (remaining <= quota.limit * 0.1) {
+      warning = `API quota low for ${apiKey}: ${remaining} remaining of ${quota.limit}`;
+    }
+
+    // Auto-save when quota is low
+    if (warning) {
+      await this.saveState();
+    }
+
+    return { remaining, warning };
+  }
+
   async getSummary(): Promise<{
     month: string;
     spent: number;
