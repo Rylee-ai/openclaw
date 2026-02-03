@@ -1,0 +1,19 @@
+name = "sharps-edge-api"
+main = "src/index.ts"
+compatibility_date = "2025-12-01"
+
+[vars]
+ENVIRONMENT = "production"
+
+# KV namespace for caching odds/analysis results
+# Create with: wrangler kv namespace create CACHE
+# Then paste the binding ID below
+[[kv_namespaces]]
+binding = "CACHE"
+id = ""        # Fill after: wrangler kv namespace create CACHE
+preview_id = "" # Fill after: wrangler kv namespace create CACHE --preview
+
+# Secrets (set via wrangler secret put):
+#   THE_ODDS_API_KEY - free tier key from the-odds-api.com
+#   X402_WALLET_ADDRESS - Base L2 wallet address for receiving payments
+#   X402_VERIFICATION_KEY - optional, for verifying payment proofs
