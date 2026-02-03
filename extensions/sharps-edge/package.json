@@ -6,8 +6,8 @@
   "dependencies": {
     "@sinclair/typebox": "0.34.48"
   },
-  "devDependencies": {
-    "openclaw": "workspace:*"
+  "peerDependencies": {
+    "openclaw": "*"
   },
   "openclaw": {
     "extensions": [
